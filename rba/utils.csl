@@ -1,0 +1,12 @@
+// Module with common functions used by many PEs
+
+// Utility function for handling multi-task multi-iteration counters.
+// Advances local counters of tasks & iterations. Returns true iff more data is expected.
+fn advance(counter: *u32, remaining_iterations: *u32, num_tasks: u32) bool {
+  counter.* += 1;
+  if (counter.* >= num_tasks) {
+    counter.* -= num_tasks;
+    remaining_iterations.* -= 1;
+  }
+  return remaining_iterations.* > 0;
+}

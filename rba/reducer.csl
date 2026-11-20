@@ -1,0 +1,137 @@
+param memcpy_params;
+param ops_file: comptime_string;
+param ops_params;
+param num_tasks: u32;
+param reduce_in0: color;
+param reduce_in1: color;
+param reduce_out: color;
+
+// Internal colors for self-activated tasks:
+const recv_task_colors = [2]local_task_id{@get_local_task_id(10), @get_local_task_id(11)};
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+const ops = @import_module(ops_file, ops_params);
+const utils = @import_module("<rba/utils>");
+
+// Buffers for sending/receiving data:
+var buf_out: [ops.OPERATION_SHARD_SERIALIZED_SIZE]f32;
+var buf_in0: [ops.OPERATION_SHARD_SERIALIZED_SIZE]f32;
+var buf_in1: [ops.OPERATION_SHARD_SERIALIZED_SIZE]f32;
+
+// Corresponding DSDs:
+const buf_out_dsd = @get_dsd(mem1d_dsd, .{.tensor_access = |i|{ops.OPERATION_SHARD_SERIALIZED_SIZE} -> buf_out[i]});
+const buf_in_dsd = [2]mem1d_dsd{
+  @get_dsd(mem1d_dsd, .{.tensor_access = |i|{ops.OPERATION_SHARD_SERIALIZED_SIZE} -> buf_in0[i]}),
+  @get_dsd(mem1d_dsd, .{.tensor_access = |i|{ops.OPERATION_SHARD_SERIALIZED_SIZE} -> buf_in1[i]}),
+};
+
+// Fabric DSDs.
+// Queues 0 and 1 (input and output) are reserved by the SDK's memcpy library, so we use the others.
+const reduce_iq = [2]input_queue{@get_input_queue(2), @get_input_queue(3)};
+const recv_reduce = [2]fabin_dsd{
+  @get_dsd(fabin_dsd, .{.extent = ops.OPERATION_SHARD_SERIALIZED_SIZE, .input_queue = reduce_iq[0]}),
+  @get_dsd(fabin_dsd, .{.extent = ops.OPERATION_SHARD_SERIALIZED_SIZE, .input_queue = reduce_iq[1]}),
+};
+const reduce_oq = @get_output_queue(2);
+const send_reduce = @get_dsd(fabout_dsd, if (@is_arch("wse3")) .{
+  .extent = ops.OPERATION_SHARD_SERIALIZED_SIZE, .output_queue = reduce_oq
+} else .{
+  .fabric_color = reduce_out, .extent = ops.OPERATION_SHARD_SERIALIZED_SIZE, .output_queue = reduce_oq
+});
+
+var pending_input: [num_tasks]ops.OperationShard;
+var has_pending_input: [num_tasks]bool;
+
+
+fn async_recv_reduce(i: u32) void {
+  // Needs to be in AST-distinct @fmovs not to interfere with each other:
+  if (i == 0) {
+    @fmovs(buf_in_dsd[i], recv_reduce[i], .{.async = true, .activate = recv_task_colors[i]});
+  } else if (i == 1) {
+    @fmovs(buf_in_dsd[i], recv_reduce[i], .{.async = true, .activate = recv_task_colors[i]});
+  } else {
+    @assert(false);
+  }
+}
+
+task on_receive_0() void {
+  on_receive(0, &buf_in0);
+}
+task on_receive_1() void {
+  on_receive(1, &buf_in1);
+}
+
+var counter = [2]u32{0, 0};
+var remaining_iterations = [2]u32{0, 0};  // including the current one
+fn on_receive(i: u32, buf: *[ops.OPERATION_SHARD_SERIALIZED_SIZE]f32) void {
+  const t = counter[i];
+
+  var operation_shard: ops.OperationShard;
+  ops.operation_shard_deserialize(&operation_shard, buf, 0);
+
+  if (!has_pending_input[t]) {
+    pending_input[t] = operation_shard;
+    has_pending_input[t] = true;
+  } else {
+    // Calculation:
+    var reduced: ops.OperationShard;
+    ops.reduce(&reduced, &pending_input[t], &operation_shard);
+
+    // Sending:
+    ops.operation_shard_serialize(&buf_out, 0, &reduced);
+    // Not sending async yet, as it would require extra logic
+    // guaranteeing that `buf_out` is not overwritten before the next send.
+    @fmovs(send_reduce, buf_out_dsd, .{.async = false});
+
+    has_pending_input[t] = false;
+  }
+
+  if (utils.advance(&counter[i], &remaining_iterations[i], num_tasks)) {
+    async_recv_reduce(i);
+  } else {
+    // Stop condition:
+    // The processed incoming message was the second one from tuple (i, 1-i):
+    if (has_pending_input[t] == false) {
+      finalize_compute();
+    }
+  }
+}
+
+fn compute(num_iterations: i32) void {
+  for (@range(u32, 2)) |i| {
+    // The same setup for both reduce inputs.
+    counter[i] = 0;
+    remaining_iterations[i] = @as(u32, num_iterations);
+    async_recv_reduce(i);
+  }
+}
+
+fn finalize_compute() void {
+  sys_mod.unblock_cmd_stream();
+}
+
+
+// Dummy, we need to export at least one variable.
+var _dummy_array: [1]f32;
+const _dummy_array_ptr: [*]f32 = &_dummy_array;
+comptime {
+  @export_symbol(_dummy_array_ptr, "shared_state");
+}
+
+comptime {
+  @initialize_queue(reduce_iq[0], .{.color = reduce_in0});
+  @initialize_queue(reduce_iq[1], .{.color = reduce_in1});
+  @initialize_queue(reduce_oq, if (@is_arch("wse3")) .{.color = reduce_out} else .{});
+  if (@is_arch("wse2")) {
+    // Colors served only by microthreaded operations. (On WSE-3 colors are not blocked, queues are bound explicitly.)
+    @block(reduce_in0);
+    @block(reduce_in1);
+    @block(reduce_out);
+  }
+
+  @bind_local_task(on_receive_0, recv_task_colors[0]);
+  @bind_local_task(on_receive_1, recv_task_colors[1]);
+
+  @export_symbol(compute);
+}

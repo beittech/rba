@@ -1,0 +1,20 @@
+param memcpy_params;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+
+fn compute(num_iterations: i32) void {
+  sys_mod.unblock_cmd_stream();
+}
+
+
+// Dummy, we need to export at least one variable.
+var _dummy_array: [1]f32;
+const _dummy_array_ptr: [*]f32 = &_dummy_array;
+comptime {
+  @export_symbol(_dummy_array_ptr, "shared_state");
+}
+
+comptime {
+  @export_symbol(compute);
+}

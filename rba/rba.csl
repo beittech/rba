@@ -1,0 +1,142 @@
+// The whole rectangle we need to fill (related to fabric dims of the target platform):
+param kernel_height: i16;
+param kernel_width: i16;
+
+// We expect the dimensions of only the Kernels here:
+param patch_count_h: i16;
+param patch_count_v: i16;
+param patch_size_h: i16 = 1;
+param patch_size_v: i16 = 1;
+
+param num_tasks: u32;
+
+// Path to the file with structures and functions definitions:
+param ops_file: comptime_string;
+param ops_params = .{};
+
+param MEMCPYH2D_DATA_SHARED_STATE: i16;  // Color ID (SDK >= 2.x expects plain IDs here).
+
+// Total dimensions of all kernel patches:
+const width = patch_count_h * patch_size_h;
+const height = patch_count_v * patch_size_v;
+
+// Dimensions with added extra PEs:
+const total_height = height + 1;
+const total_width = width + 1;
+comptime {
+  @comptime_assert(total_height <= kernel_height);
+  @comptime_assert(total_width <= kernel_width);
+}
+
+
+const reduce_flow_kernels = [2]color{@get_color(0), @get_color(1)}; // to alternate (checkboard pattern)
+const reduce_flow_reducers = [2]color{@get_color(2), @get_color(3)}; // to alternate (checkboard pattern)
+const broadcast_flow = @get_color(4);
+
+const memcpy = @import_module("<memcpy/get_params>", .{ .width = kernel_width, .height = kernel_height, .MEMCPYH2D_1 = MEMCPYH2D_DATA_SHARED_STATE});
+
+fn lay() void {
+  @set_rectangle(kernel_width, kernel_height);
+
+  // Kernel PEs:
+  for (@range(i16, width)) |x| { for (@range(i16, height)) |y| {
+    const p = (x + y) % 2;
+
+    const params = .{
+      .memcpy_params = memcpy.get_params(x),
+      .ops_file = ops_file,
+      .ops_params = ops_params,
+      .num_tasks = num_tasks,
+
+      .num_reduce_in = if (x == 0) 0 else 1,
+      .reduce_in = reduce_flow_kernels[p],
+      .reduce_out = reduce_flow_kernels[1 - p],
+      .broadcast_in = broadcast_flow,
+    };
+    @set_tile_code(x, y, "<rba/kernel>", params);
+    if (params.num_reduce_in > 0)
+      @set_color_config(x, y, params.reduce_in, .{.routes = .{.rx = .{WEST}, .tx = .{RAMP}}});
+    @set_color_config(x, y, params.reduce_out, .{.routes = .{.rx = .{RAMP}, .tx = .{EAST}}});
+    @set_color_config(x, y, params.broadcast_in, .{.routes = .{.rx = .{SOUTH}, .tx = if (y > 0) .{RAMP, NORTH} else .{RAMP}}});
+  }}
+
+  // East reducers:
+  // This excludes the northmost one, which would have only one input, hence can be a router only.
+  for (@range(i16, 1, height, 1)) |y| {
+    const x = width;
+    const p = (x + y) % 2;
+
+    const params = .{
+      .memcpy_params = memcpy.get_params(x),
+      .ops_file = ops_file,
+      .ops_params = ops_params,
+      .num_tasks = num_tasks,
+
+      .reduce_in0 = reduce_flow_kernels[p],
+      .reduce_in1 = if (y > 1) reduce_flow_reducers[p] else reduce_flow_kernels[1 - p],
+      .reduce_out = reduce_flow_reducers[1 - p],
+    };
+    @set_tile_code(x, y, "<rba/reducer>", params);
+    @set_color_config(x, y, params.reduce_in1, .{.routes = .{.rx = .{NORTH}, .tx = .{RAMP}}});
+    @set_color_config(x, y, params.reduce_in0, .{.routes = .{.rx = .{WEST}, .tx = .{RAMP}}});
+    @set_color_config(x, y, params.reduce_out, .{.routes = .{.rx = .{RAMP}, .tx = .{SOUTH}}});
+  }
+
+  // Single north-east router:
+  {
+    const x = width;
+    const y = 0;
+    const p = (x + y) % 2;
+
+    const params = .{
+      .memcpy_params = memcpy.get_params(x),
+    };
+    @set_tile_code(x, y, "<rba/router>", params);
+    @set_color_config(x, y, reduce_flow_kernels[p], .{.routes = .{.rx = .{WEST}, .tx = .{SOUTH}}});
+  }
+
+  // Principal:
+  {
+    const x = width;
+    const y = height;
+    const p = (x + y) % 2;
+
+    const params = .{
+      .memcpy_params = memcpy.get_params(x),
+      .ops_file = ops_file,
+      .ops_params = ops_params,
+      .num_tasks = num_tasks,
+      .reduce_in = reduce_flow_reducers[p],
+      .broadcast_out = broadcast_flow,
+    };
+    @set_tile_code(x, y, "<rba/principal>", params);
+    @set_color_config(x, y, params.reduce_in, .{.routes = .{.rx = .{NORTH}, .tx = .{RAMP}}});
+    @set_color_config(x, y, params.broadcast_out, .{.routes = .{.rx = .{RAMP}, .tx = .{WEST}}});
+  }
+
+  // South routers:
+  for (@range(i16, width)) |x| {
+    const y = height;
+
+    const params = .{
+      .memcpy_params = memcpy.get_params(x),
+    };
+    @set_tile_code(x, y, "<rba/router>", params);
+    @set_color_config(x, y, broadcast_flow, .{.routes = .{.rx = .{EAST}, .tx = if (x > 0) .{WEST, NORTH} else .{NORTH}}});
+  }
+
+  // Outside of our computation area, still need to provide working memcpy infrastructure for the remaining PEs.
+  // Reusing `router` code for that (which does nothing).
+  for (@range(i16, kernel_width)) |x| {
+    for (@range(i16, kernel_height)) |y| {
+      if (x <= width and y <= height) continue;
+      @set_tile_code(x, y, "<rba/router>", .{.memcpy_params = memcpy.get_params(x)});
+    }
+  }
+
+
+  @export_name("task_state", [*]f32, false); // has different size between principal [ops.TASK_GLOBAL_STATE_SERIALIZED_SIZE * num_tasks] /kernel [ops.TASK_LOCAL_STATE_SERIALIZED_SIZE * num_tasks]
+  @export_name("shared_state", [*]f32, false); //has different size between principal [ops.TASK_GLOBAL_STATE_SERIALIZED_SIZE * num_tasks] /reducer, router [1]
+  @export_name("compute", fn(i32)void); // arguments: num_iterations.
+  // Note: i32 rather than u32, as Python integers are passed as i32 when launching this function through the SDK.
+}

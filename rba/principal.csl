@@ -1,0 +1,99 @@
+param memcpy_params;
+param ops_file: comptime_string;
+param ops_params;
+param num_tasks: u32;
+param reduce_in: color;
+param broadcast_out: color;
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+const ops = @import_module(ops_file, ops_params);
+
+
+var shared_global_state: ops.SharedGlobalState;
+var serialized_shared_global_state: [ops.SHARED_GLOBAL_STATE_SERIALIZED_SIZE]f32;
+const serialized_shared_global_state_ptr: [*] f32 = &serialized_shared_global_state;
+
+var task_global_state: [num_tasks]ops.TaskGlobalState;
+var serialized_task_global_state: [ops.TASK_GLOBAL_STATE_SERIALIZED_SIZE * num_tasks]f32;
+const serialized_task_global_state_ptr: [*] f32 = &serialized_task_global_state;
+
+
+// Buffers for sending/receiving data:
+var buf_operation_shard: [ops.OPERATION_SHARD_SERIALIZED_SIZE]f32;
+var buf_operation: [ops.OPERATION_SERIALIZED_SIZE]f32;
+
+// Corresponding DSDs:
+const buf_operation_shard_dsd = @get_dsd(mem1d_dsd, .{.tensor_access = |i|{ops.OPERATION_SHARD_SERIALIZED_SIZE} -> buf_operation_shard[i]});
+const buf_operation_dsd = @get_dsd(mem1d_dsd, .{.tensor_access = |i|{ops.OPERATION_SERIALIZED_SIZE} -> buf_operation[i]});
+
+// Fabric DSDs.
+// Queues 0 and 1 (input and output) are reserved by the SDK's memcpy library, so we use the others.
+// On WSE-3 the color of an output queue is set when the queue is initialized, not in the DSD.
+const reduce_iq = @get_input_queue(2);
+const broadcast_oq = @get_output_queue(2);
+const recv_operation_shard = @get_dsd(fabin_dsd, .{.extent = ops.OPERATION_SHARD_SERIALIZED_SIZE, .input_queue = reduce_iq});
+const send_operation = @get_dsd(fabout_dsd, if (@is_arch("wse3")) .{
+  .extent = ops.OPERATION_SERIALIZED_SIZE, .output_queue = broadcast_oq
+} else .{
+  .fabric_color = broadcast_out, .extent = ops.OPERATION_SERIALIZED_SIZE, .output_queue = broadcast_oq
+});
+
+
+fn deserialize() void {
+  ops.shared_global_state_deserialize(&shared_global_state, &serialized_shared_global_state, 0);
+  for (@range(u32, num_tasks)) |t| {
+    ops.task_global_state_deserialize(&task_global_state[t], &serialized_task_global_state, ops.TASK_GLOBAL_STATE_SERIALIZED_SIZE * t);
+  }
+}
+
+fn serialize() void {
+  for (@range(u32, num_tasks)) |t| {
+    ops.task_global_state_serialize(&serialized_task_global_state, ops.TASK_GLOBAL_STATE_SERIALIZED_SIZE * t, &task_global_state[t]);
+  }
+}
+
+fn handle_task(t: u32) void {
+  // Receiving:
+  // No need to async receive, as we expect only this kind of message.
+  @fmovs(buf_operation_shard_dsd, recv_operation_shard, .{.async = false});
+  var operation_shard: ops.OperationShard;
+  ops.operation_shard_deserialize(&operation_shard, &buf_operation_shard, 0);
+  // It assumes that the received data corresponds to task `t` (guaranteed by the message ordering, see README).
+
+  // Calculation:
+  var operation: ops.Operation;
+  ops.finalize(&operation, &operation_shard, &task_global_state[t], @ptrcast(* const ops.SharedGlobalState, &shared_global_state));
+
+  // Sending:
+  ops.operation_serialize(&buf_operation, 0, &operation);
+  // Not sending async, as we don't prevent `buf_operation` from being overwritten in the next call to `handle_task`.
+  @fmovs(send_operation, buf_operation_dsd, .{.async = false});
+}
+
+fn iteration() void {
+  for (@range(u32, num_tasks)) |t| {
+    handle_task(t);
+  }
+}
+
+fn compute(num_iterations: i32) void {
+
+  deserialize();
+  for (@range(u32, @as(u32, num_iterations))) |i| {
+    iteration();
+  }
+  serialize();
+
+  sys_mod.unblock_cmd_stream();
+}
+
+
+comptime {
+  @initialize_queue(reduce_iq, .{.color = reduce_in});
+  @initialize_queue(broadcast_oq, if (@is_arch("wse3")) .{.color = broadcast_out} else .{});
+
+  @export_symbol(serialized_shared_global_state_ptr, "shared_state");
+  @export_symbol(serialized_task_global_state_ptr, "task_state");
+  @export_symbol(compute);
+}

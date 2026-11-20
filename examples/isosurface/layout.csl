@@ -1,0 +1,24 @@
+param kernel_width: i16;
+param kernel_height: i16;
+param size: i16;
+param patch_width: i16;
+param patch_height: i16;
+param num_tasks: u32;
+
+// Params with strict naming convenction requirements
+param MEMCPYH2D_DATA_1_ID: u16;
+
+const rba = @import_module("<rba/rba>", .{
+  .kernel_width = kernel_width,
+  .kernel_height = kernel_height,
+  .patch_count_h = size,
+  .patch_count_v = size,
+  .patch_size_h = patch_width,
+  .patch_size_v = patch_height,
+  .num_tasks = num_tasks,
+  .ops_file = "<isosurface/rba_ops>",
+  .ops_params = .{.size = size},
+  .MEMCPYH2D_DATA_SHARED_STATE = @as(i16, MEMCPYH2D_DATA_1_ID),
+});
+
+layout { rba.lay(); }

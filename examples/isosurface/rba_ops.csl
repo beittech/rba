@@ -1,0 +1,152 @@
+
+param size: u16;
+param degree: comptime_int = 2;
+
+// Structures:
+const SharedGlobalState = struct {
+  threshold: f32,  // The value of quadratic form we are looking for.
+};
+
+const TaskGlobalState = struct {
+  rng_state: u32,  // Per-task random number generator. If seeded differently, would yield different samples (expected).
+};
+
+const SharedLocalState = struct {
+  coefficient: f32, // The coefficient for quadratic monomial.
+  var_idx: [degree]u16,  // Which variables participate in this monomial.
+};
+
+const LowerUpper = struct { lower: f32, upper: f32 };
+
+const TaskLocalState = struct {
+  exceptional_var_idx: u16,
+  exceptional_var_proportion: f32,
+  vars: [degree]LowerUpper, // Variable assignments that realizes form's value lower/upper than the threshold.
+};
+
+const OperationShard = struct {
+  partial_sum: f32,  // Partial sum of the polynomial, for thebisection point mid assignment.
+};
+
+const Operation = struct {
+  adjust: u16, // 0 - lower, 1 - upper; no idea how to use enums
+  next_exceptional_var_idx: u16,
+  next_exceptional_var_proportion: f32,
+};
+
+// Functions:
+fn produce(x: *OperationShard, t: *TaskLocalState, s: *const SharedLocalState) void {
+  var product: f32 = 1.0;
+  for (@range(u16, degree)) |i| {
+    product *= midpoint(i, t, s);
+  }
+  x.* = OperationShard {
+    .partial_sum = product * s.*.coefficient,
+  };
+}
+
+fn reduce(result: *OperationShard, x: *const OperationShard, y: *const OperationShard) void {
+  result.* = OperationShard {
+    .partial_sum = x.*.partial_sum + y.*.partial_sum,
+  };
+}
+
+fn finalize(op: *Operation, x: *const OperationShard, t: *TaskGlobalState, s: *const SharedGlobalState) void {
+  const P: comptime_int = 94164613; // random prime;
+  t.*.rng_state *= P;
+  op.* = Operation {
+    .adjust = if (x.*.partial_sum < s.*.threshold) 0 else 1,
+    // The following random variables are not independent, but we don't care as it is only a test/example.
+    .next_exceptional_var_idx = @as(u16, t.*.rng_state % @as(u32, size)),
+    .next_exceptional_var_proportion = @as(f32, t.*.rng_state) / 4294967295.0,
+  };
+}
+
+fn apply(op: *const Operation, t: *TaskLocalState, s: *const SharedLocalState) void {
+  for (@range(u16, degree)) |i| {
+    const mid = midpoint(i, t, s);
+    switch (op.*.adjust) {
+      0 => t.*.vars[i].lower = mid,
+      1 => t.*.vars[i].upper= mid,
+      else => @assert(false),
+    }
+  }
+
+  t.*.exceptional_var_idx = op.*.next_exceptional_var_idx;
+  t.*.exceptional_var_proportion = op.*.next_exceptional_var_proportion;
+}
+
+// Helper function
+fn midpoint(local_var_idx: u16, t: *TaskLocalState, s: *const SharedLocalState) f32 {
+  const idx = s.*.var_idx[local_var_idx];
+  const proportion = if (idx == t.*.exceptional_var_idx) t.*.exceptional_var_proportion else 0.5;
+  const lu = t.*.vars[local_var_idx];
+  return (1.0-proportion) * lu.lower + proportion * lu.upper;
+}
+
+
+// Serializations:
+const SHARED_GLOBAL_STATE_SERIALIZED_SIZE: u32 = 1;
+fn shared_global_state_deserialize(s: *SharedGlobalState, source: [*]const f32, offset: u32) void {
+  s.* = SharedGlobalState { .threshold = source[offset + 0] };
+}
+
+const TASK_GLOBAL_STATE_SERIALIZED_SIZE: u32 = 1;
+fn task_global_state_serialize(target: [*]f32, offset: u32, x: *const TaskGlobalState) void {
+  target[offset + 0] = @bitcast(f32, x.*.rng_state);
+}
+fn task_global_state_deserialize(s: *TaskGlobalState, source: [*]const f32, offset: u32) void {
+  s.* = TaskGlobalState { .rng_state = @bitcast(u32, source[offset + 0]) };
+}
+
+fn shared_local_state_from_stream(s: *SharedLocalState, first: f32, comptime stream: fabin_dsd) void {
+  s.*.coefficient = first;
+
+  var f: f32;
+  for (@range(u32, degree)) |i| {
+    @fmovs(&f, stream);
+    s.*.var_idx[i] = @as(u16, f);
+  }
+}
+
+const TASK_LOCAL_STATE_SERIALIZED_SIZE: u32 = 2 + degree * 2;
+fn task_local_state_serialize(target: [*]f32, offset: u32, t: *const TaskLocalState) void {
+  target[offset + 0] = @as(f32, t.*.exceptional_var_idx);
+  target[offset + 1] = t.*.exceptional_var_proportion;
+  for (@range(u32, degree)) |i| {
+    target[offset + 2 + 2 * i + 0] = t.*.vars[i].lower;
+    target[offset + 2 + 2 * i + 1] = t.*.vars[i].upper;
+  }
+}
+fn task_local_state_deserialize(t: *TaskLocalState, source: [*]const f32, offset: u32) void {
+  t.*.exceptional_var_idx = @as(u16, source[offset + 0]);
+  t.*.exceptional_var_proportion = source[offset + 1];
+  for (@range(u32, degree)) |i| {
+    t.*.vars[i].lower = source[offset + 2 + 2 * i + 0];
+    t.*.vars[i].upper = source[offset + 2 + 2 * i + 1];
+  }
+}
+
+const OPERATION_SHARD_SERIALIZED_SIZE: u32 = 1;
+fn operation_shard_serialize(target: [*]f32, offset: u32, x: *const OperationShard) void {
+  target[offset + 0] = x.*.partial_sum;
+}
+fn operation_shard_deserialize(x: *OperationShard, source: [*]const f32, offset: u32) void {
+  x.* = OperationShard {
+    .partial_sum = source[offset + 0],
+  };
+}
+
+const OPERATION_SERIALIZED_SIZE: u32 = 3;
+fn operation_serialize(target: [*]f32, offset: u32, x: *const Operation) void {
+  target[offset + 0] = @as(f32, x.*.adjust);
+  target[offset + 1] = @as(f32, x.*.next_exceptional_var_idx);
+  target[offset + 2] = x.*.next_exceptional_var_proportion;
+}
+fn operation_deserialize(x: *Operation, source: [*]const f32, offset: u32) void {
+  x.* = Operation {
+    .adjust = @as(u16, source[offset + 0]),
+    .next_exceptional_var_idx = @as(u16, source[offset + 1]),
+    .next_exceptional_var_proportion = source[offset + 2],
+  };
+}

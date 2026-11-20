@@ -1,0 +1,6 @@
+/build/
+sim.log
+simconfig.json
+wio_flows_tmpdir.*
+__pycache__/
+sim_stats.json

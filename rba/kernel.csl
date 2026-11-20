@@ -1,0 +1,263 @@
+param memcpy_params;
+param ops_file: comptime_string;
+param ops_params;
+param num_tasks: u32;
+param num_reduce_in: i16;
+param reduce_in: color;
+param reduce_out: color;
+param broadcast_in: color;
+
+// Internal colors for self-activated tasks:
+const recv_operation_shard_color: local_task_id = @get_local_task_id(11);
+const recv_operation_color: local_task_id = @get_local_task_id(12);
+
+const sys_mod = @import_module("<memcpy/memcpy>", memcpy_params);
+
+const ops = @import_module(ops_file, ops_params);
+const utils = @import_module("<rba/utils>");
+
+
+var shared_local_state: ops.SharedLocalState;
+
+var task_local_state: [num_tasks]ops.TaskLocalState;
+var serialized_task_local_state: [ops.TASK_LOCAL_STATE_SERIALIZED_SIZE * num_tasks]f32;
+const serialized_task_local_state_ptr: [*] f32 = &serialized_task_local_state;
+
+var pending_operation_shard: [num_tasks]ops.OperationShard;
+
+
+// Processing states.
+//
+// Not including the buffering processing state, as there is only one non-terminal state.
+//
+const ProductionProcessingState = enum(u16) {
+  idle,
+  generating,
+  done
+};
+var production_processing_state: [num_tasks]ProductionProcessingState;
+const OperationProcessingState = enum(u16) {
+  applied,
+  sent,
+  lagging
+};
+var operation_processing_state: [num_tasks]OperationProcessingState;
+
+
+// Buffers for sending/receiving data:
+var buf_shard_out: [ops.OPERATION_SHARD_SERIALIZED_SIZE]f32;
+var buf_shard_in: [ops.OPERATION_SHARD_SERIALIZED_SIZE]f32;
+var buf_broadcast: [ops.OPERATION_SERIALIZED_SIZE]f32;
+
+// Corresponding DSDs:
+const buf_shard_out_dsd = @get_dsd(mem1d_dsd, .{.tensor_access = |i|{ops.OPERATION_SHARD_SERIALIZED_SIZE} -> buf_shard_out[i]});
+const buf_shard_in_dsd = @get_dsd(mem1d_dsd, .{.tensor_access = |i|{ops.OPERATION_SHARD_SERIALIZED_SIZE} -> buf_shard_in[i]});
+const buf_broadcast_dsd = @get_dsd(mem1d_dsd, .{.tensor_access = |i|{ops.OPERATION_SERIALIZED_SIZE} -> buf_broadcast[i]});
+
+// Fabric DSDs.
+// Queues 0 and 1 (input and output) are reserved by the SDK's memcpy library, so we use the others.
+// On WSE-3 the color of an output queue is set when the queue is initialized, not in the DSD.
+const reduce_iq = @get_input_queue(2);
+const broadcast_iq = @get_input_queue(3);
+const shared_state_iq = @get_input_queue(4);
+const reduce_oq = @get_output_queue(2);
+
+const recv_reduce = @get_dsd(fabin_dsd, .{.extent = ops.OPERATION_SHARD_SERIALIZED_SIZE, .input_queue = reduce_iq});
+const send_reduce = @get_dsd(fabout_dsd, if (@is_arch("wse3")) .{
+  .extent = ops.OPERATION_SHARD_SERIALIZED_SIZE, .output_queue = reduce_oq
+} else .{
+  .fabric_color = reduce_out, .extent = ops.OPERATION_SHARD_SERIALIZED_SIZE, .output_queue = reduce_oq
+});
+
+const recv_broadcast = @get_dsd(fabin_dsd, .{.extent = ops.OPERATION_SERIALIZED_SIZE, .input_queue = broadcast_iq});
+
+
+// Produces `OperationShard` and sends it.
+// If needed (non-westmost Kernel), it is first `reduce`d with stored `OperationShard` that came from the west.
+// Must be called only if the `Operation` was applied and `OperationShard` is approprietly stored (non-westmost Kernel).
+fn do_produce_reduce_send(t: u32) void {
+  var produced: ops.OperationShard;
+  ops.produce(&produced, &task_local_state[t], @ptrcast(* const ops.SharedLocalState, &shared_local_state));
+
+  if (num_reduce_in == 0) {
+    ops.operation_shard_serialize(&buf_shard_out, 0, &produced);
+  } else {
+    var reduced: ops.OperationShard;
+    ops.reduce(&reduced, &produced, &pending_operation_shard[t]);
+    ops.operation_shard_serialize(&buf_shard_out, 0, &reduced);
+  }
+
+  // Not sending async yet, as it would require extra logic
+  // guaranteeing that `buf_shard_out` is not overwritten before the next send.
+  @fmovs(send_reduce, buf_shard_out_dsd, .{.async = false});
+}
+
+// Flag specific to westmost Kernels.
+// Setting it, confirms that all the tasks from first iteration have their first `OperationShard` emitted,
+// and the (potential) queue of incoming `Operation`s is cleared.
+// Note that such queue may span unbounded number of further iterations if tasks are processed quickly.
+var emission_order_guaranteed: bool = false;
+
+var counter_recv: u32 = 0;
+var remaining_iterations_recv: u32 = 0; // including the current one
+
+// Task called in response to incoming `OperationShard`.
+// Despite the name, it is also used in westmost Kernels for
+// the initial emission of `OperationShard`, as the logic is very similar.
+task on_receive_operation_shard() void {
+  const t = counter_recv;
+
+  if (num_reduce_in > 0) {
+    ops.operation_shard_deserialize(&pending_operation_shard[t], &buf_shard_in, 0);
+  }
+
+  switch (operation_processing_state[t]) {
+    OperationProcessingState.applied => {
+      do_produce_reduce_send(t);
+      operation_processing_state[t] = OperationProcessingState.sent;
+    },
+    OperationProcessingState.sent => {
+      operation_processing_state[t] = OperationProcessingState.lagging;
+    },
+    else => @assert(false),
+  }
+
+  if (utils.advance(&counter_recv, &remaining_iterations_recv, num_tasks)) {
+    if (num_reduce_in > 0) {
+      @fmovs(buf_shard_in_dsd, recv_reduce, .{.async = true, .activate = recv_operation_shard_color});
+    } else {
+      if (operation_processing_state[t] == OperationProcessingState.sent) {
+        // Our emission for task `t` was successful.
+        // It was either emission in the first iteration, or some already-applied `OperationShard` from other iteration.
+        // We should try the next one.
+        @activate(recv_operation_shard_color);
+      } else {
+        // First encounter of a task that has not been yet processed by the other PEs.
+        // At this point we stop calling this task. We ensured that tasks are processed in order by all PEs.
+        // All further emission of `OperationShard` will be handled in response to incoming `Operation`.
+        emission_order_guaranteed = true;
+      }
+    }
+  }
+}
+
+
+var counter_broadcast: u32 = 0;
+var remaining_iterations_broadcast: u32 = 0; // including the current one
+task on_receive_operation() void {
+  const t = counter_broadcast;
+  var operation: ops.Operation;
+  ops.operation_deserialize(&operation, &buf_broadcast, 0);
+
+  ops.apply(&operation, &task_local_state[t], @ptrcast(* const ops.SharedLocalState, &shared_local_state));
+
+  if (num_reduce_in == 0) {
+    if (emission_order_guaranteed) {
+      if (remaining_iterations_broadcast > 1) {
+        do_produce_reduce_send(t);
+      }
+    } else {
+      @assert(operation_processing_state[t] == OperationProcessingState.sent);
+      operation_processing_state[t] = OperationProcessingState.applied;
+    }
+  } else {
+    switch (operation_processing_state[t]) {
+      OperationProcessingState.sent => {
+        operation_processing_state[t] = OperationProcessingState.applied;
+      },
+      OperationProcessingState.lagging => {
+        if (remaining_iterations_broadcast > 1) {
+          do_produce_reduce_send(t);
+        }
+        operation_processing_state[t] = OperationProcessingState.sent;
+      },
+      else => @assert(false),
+    }
+  }
+
+  if (utils.advance(&counter_broadcast, &remaining_iterations_broadcast, num_tasks)) {
+    // Wait for the next one:
+    @fmovs(buf_broadcast_dsd, recv_broadcast, .{.async = true, .activate = recv_operation_color});
+  } else {
+    compute_finalize();
+  }
+}
+
+fn deserialize() void {
+  for (@range(u32, num_tasks)) |t| {
+    ops.task_local_state_deserialize(&task_local_state[t], &serialized_task_local_state, ops.TASK_LOCAL_STATE_SERIALIZED_SIZE * t);
+  }
+}
+
+fn serialize() void {
+  for (@range(u32, num_tasks)) |t| {
+    ops.task_local_state_serialize(&serialized_task_local_state, ops.TASK_LOCAL_STATE_SERIALIZED_SIZE * t, &task_local_state[t]);
+  }
+}
+
+fn compute(num_iterations: i32) void {
+  deserialize();
+
+  // Prepare initial state. Can't just use … = @constants(…).
+  for (@range(u32, num_tasks)) |t| {
+    production_processing_state[t] = ProductionProcessingState.idle;
+    operation_processing_state[t] = OperationProcessingState.applied;
+  }
+  emission_order_guaranteed = false;
+
+  counter_recv = 0;
+  remaining_iterations_recv = @as(u32, num_iterations);
+  if (num_reduce_in == 1) {
+    @fmovs(buf_shard_in_dsd, recv_reduce, .{.async = true, .activate = recv_operation_shard_color});
+  } else {
+    @activate(recv_operation_shard_color);
+  }
+
+  counter_broadcast = 0;
+  remaining_iterations_broadcast = @as(u32, num_iterations);
+  @fmovs(buf_broadcast_dsd, recv_broadcast, .{.async = true, .activate = recv_operation_color});
+}
+
+fn compute_finalize() void {
+  serialize();
+  sys_mod.unblock_cmd_stream();
+}
+
+// The shared local state arrives from the host as a stream; the task is activated by its first word.
+// Data task IDs come from colors on WSE-2 and from input queues on WSE-3.
+const memcpy_recv_shared_state_color: color = @get_color(sys_mod.MEMCPYH2D_1);
+const memcpy_recv_shared_state_task_id: data_task_id =
+  if (@is_arch("wse3")) @get_data_task_id(shared_state_iq) else @get_data_task_id(memcpy_recv_shared_state_color);
+// Reads the remaining words of the stream, one by one:
+const recv_shared_state_word = @get_dsd(fabin_dsd, if (@is_arch("wse3")) .{
+  .extent = 1, .input_queue = shared_state_iq
+} else .{
+  .extent = 1, .fabric_color = memcpy_recv_shared_state_color
+});
+comptime {
+  @bind_data_task(memcpy_recv_shared_state, memcpy_recv_shared_state_task_id);
+}
+task memcpy_recv_shared_state(data : f32) void {
+  @block(memcpy_recv_shared_state_task_id);
+  ops.shared_local_state_from_stream(&shared_local_state, data, recv_shared_state_word);
+  @unblock(memcpy_recv_shared_state_task_id);
+}
+
+
+comptime {
+  @initialize_queue(reduce_iq, .{.color = reduce_in});
+  @initialize_queue(broadcast_iq, .{.color = broadcast_in});
+  @initialize_queue(shared_state_iq, .{.color = memcpy_recv_shared_state_color});
+  @initialize_queue(reduce_oq, if (@is_arch("wse3")) .{.color = reduce_out} else .{});
+  if (@is_arch("wse2")) {
+    // Colors served only by microthreaded operations. (On WSE-3 colors are not blocked, queues are bound explicitly.)
+    @block(reduce_in);
+    @block(reduce_out);
+    @block(broadcast_in);
+  }
+  @bind_local_task(on_receive_operation, recv_operation_color);
+  @bind_local_task(on_receive_operation_shard, recv_operation_shard_color);
+
+  @export_symbol(serialized_task_local_state_ptr, "task_state");
+  @export_symbol(compute);
+}
